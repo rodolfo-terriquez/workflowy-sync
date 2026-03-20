@@ -1,5 +1,3 @@
-/* eslint-disable obsidianmd/ui/sentence-case */
-
 import { Editor, MarkdownView, Notice, Plugin, TFile, normalizePath } from "obsidian";
 import { registerQuickSendCommands } from "./commands/quick-send";
 import { registerSyncCommands } from "./commands/sync-mappings";
@@ -88,7 +86,7 @@ export default class WorkflowySyncPlugin extends Plugin {
 
 	getClientOrNotice(): WorkflowyClient | null {
 		if (!this.settings.apiKey.trim()) {
-			new Notice("Add your Workflowy API key in the plugin settings first.");
+			new Notice("Add your API key in plugin settings first.");
 			return null;
 		}
 
@@ -98,7 +96,7 @@ export default class WorkflowySyncPlugin extends Plugin {
 	getActiveMarkdownEditor(): { editor: Editor; file: TFile | null } | null {
 		const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
 		if (!markdownView) {
-			new Notice("Open a markdown note to use Workflowy Sync.");
+			new Notice("Open a Markdown note to use sync.");
 			return null;
 		}
 

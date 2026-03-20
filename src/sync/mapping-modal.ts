@@ -1,5 +1,3 @@
-/* eslint-disable obsidianmd/ui/sentence-case */
-
 import { App, Modal, Notice, Setting, normalizePath } from "obsidian";
 import type WorkflowySyncPlugin from "../main";
 import type { SyncMapping, SyncMappingDraft } from "../types";
@@ -58,7 +56,7 @@ export class WorkflowyMappingModal extends Modal {
 		titleEl.setText(this.options.mapping ? "Edit sync mapping" : "Add sync mapping");
 
 		contentEl.createEl("p", {
-			text: "Create a sync mapping between one Workflowy item and one Obsidian note. Sync mappings move content only, without renaming the mapped Workflowy root item or the note title.",
+			text: "Create a sync mapping between one outline item and one Obsidian note. Sync mappings move content only, without renaming the mapped root item or note title.",
 			cls: "workflowy-sync-settings-note",
 		});
 
@@ -104,11 +102,11 @@ export class WorkflowyMappingModal extends Modal {
 
 		new Setting(contentEl)
 			.setName("Sync direction")
-			.setDesc("Choose whether this mapping pulls Workflowy into Obsidian or pushes Obsidian content back into Workflowy.")
+			.setDesc("Choose whether this mapping pulls content into Obsidian or pushes note content back out.")
 			.addDropdown((dropdown) => {
 				dropdown
 					.addOption("wf-to-ob", "Workflowy -> Obsidian")
-					.addOption("ob-to-wf", "Obsidian -> Workflowy")
+					.addOption("ob-to-wf", "Obsidian -> selected item")
 					.setValue(this.direction)
 					.onChange((value: SyncMappingDraft["direction"]) => {
 						this.direction = value;
@@ -118,7 +116,7 @@ export class WorkflowyMappingModal extends Modal {
 
 		if (this.direction === "ob-to-wf") {
 			contentEl.createEl("p", {
-				text: "Reverse sync keeps the selected Workflowy root item and replaces its children in place. Plain lines become bullets, Markdown tasks become todos, and item notes require extra follow-up updates.",
+				text: "Reverse sync keeps the selected root item and replaces its children in place. Plain lines become bullets, Markdown tasks become todos, and item notes require extra follow-up updates.",
 				cls: "workflowy-sync-settings-note",
 			});
 		}
@@ -166,7 +164,7 @@ export class WorkflowyMappingModal extends Modal {
 
 		new Setting(contentEl)
 			.setName("Include completed items")
-			.setDesc("Keep completed Workflowy items in this synced note.")
+			.setDesc("Keep completed items in this synced note.")
 			.addToggle((toggle) => {
 				toggle
 					.setValue(this.includeCompleted)
@@ -249,7 +247,7 @@ export class WorkflowyMappingModal extends Modal {
 		}
 
 		if (!workflowyIdentifier) {
-			new Notice("Choose a Workflowy node or target for this mapping.");
+			new Notice("Choose a node or target for this mapping.");
 			return null;
 		}
 
@@ -259,7 +257,7 @@ export class WorkflowyMappingModal extends Modal {
 		}
 
 		if (!obsidianPath.toLowerCase().endsWith(".md")) {
-			new Notice("Sync mappings currently require a markdown note path ending in .md.");
+			new Notice("Sync mappings currently require a Markdown note path ending in .md.");
 			return null;
 		}
 

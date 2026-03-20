@@ -1,5 +1,3 @@
-/* eslint-disable obsidianmd/ui/sentence-case */
-
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type WorkflowySyncPlugin from "../main";
 import type { SyncMapping } from "../types";
@@ -36,7 +34,7 @@ export class WorkflowySettingTab extends PluginSettingTab {
 			.setDesc(statusFragment)
 			.addText((text) => {
 				text
-					.setPlaceholder("wf_...")
+					.setPlaceholder("Paste API key")
 					.setValue(this.plugin.settings.apiKey)
 					.onChange(async (value) => {
 						this.plugin.settings.apiKey = value.trim();
@@ -106,7 +104,7 @@ export class WorkflowySettingTab extends PluginSettingTab {
 						if (target) {
 							new Notice(`Saved default Workflowy target: ${target.label}`);
 						} else {
-							new Notice("Cleared the default Workflowy target.");
+							new Notice("Default target cleared.");
 						}
 						this.display();
 					} catch (error) {
@@ -120,14 +118,14 @@ export class WorkflowySettingTab extends PluginSettingTab {
 				button.setTooltip("Clear default target");
 				button.onClick(async () => {
 					await this.plugin.clearDefaultTarget();
-					new Notice("Cleared the default Workflowy target.");
+					new Notice("Default target cleared.");
 					this.display();
 				});
 			});
 
 		new Setting(containerEl)
 			.setName("Include Obsidian backlink")
-			.setDesc("Add an obsidian:// link to the created Workflowy node note when sending content.")
+			.setDesc("Add an Obsidian link to the created node note when sending content.")
 			.addToggle((toggle) => {
 				toggle
 					.setValue(this.plugin.settings.includeObsidianBacklink)
@@ -143,7 +141,7 @@ export class WorkflowySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Show completed items")
-			.setDesc("When disabled, completed Workflowy nodes are hidden from live workflowy code blocks.")
+			.setDesc("When disabled, completed nodes are hidden from live code blocks.")
 			.addToggle((toggle) => {
 				toggle
 					.setValue(this.plugin.settings.embedShowCompleted)
@@ -182,7 +180,7 @@ export class WorkflowySettingTab extends PluginSettingTab {
 			});
 
 		containerEl.createEl("p", {
-			text: "Sync mappings connect one Workflowy item to one Obsidian note. They can pull Workflowy into Obsidian or push Obsidian back into Workflowy, and can run manually, on app open, or on an interval.",
+			text: "Sync mappings connect one outline item to one Obsidian note. They can pull content into Obsidian or push note content back out, and can run manually, on app open, or on an interval.",
 			cls: "workflowy-sync-settings-note",
 		});
 

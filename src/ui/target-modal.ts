@@ -1,5 +1,3 @@
-/* eslint-disable obsidianmd/ui/sentence-case */
-
 import { App, SuggestModal } from "obsidian";
 import type { WorkflowyResolvedTarget } from "../types";
 
@@ -27,7 +25,7 @@ export class WorkflowyTargetModal extends SuggestModal<WorkflowyTargetSuggestion
 		super(app);
 		this.options = options;
 		this.emptyStateText = "Type a Workflowy target, node ID, or URL.";
-		this.setPlaceholder("Search Workflowy targets or paste a URL / node ID");
+		this.setPlaceholder("Search targets or paste a URL / node ID");
 	}
 
 	onOpen(): void {

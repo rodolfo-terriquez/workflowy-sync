@@ -1,5 +1,3 @@
-/* eslint-disable obsidianmd/commands/no-plugin-id-in-command-id, obsidianmd/ui/sentence-case */
-
 import { Notice } from "obsidian";
 import type WorkflowySyncPlugin from "../main";
 import type { SyncMapping } from "../types";
@@ -7,8 +5,8 @@ import { WorkflowyMappingPickerModal } from "../sync/mapping-picker-modal";
 
 export function registerSyncCommands(plugin: WorkflowySyncPlugin): void {
 	plugin.addCommand({
-		id: "workflowy-sync:sync-mapping-now",
-		name: "Sync: Workflowy mapping now",
+		id: "sync-mapping-now",
+		name: "Workflowy: run sync mapping",
 		callback: async () => {
 			await runMappingSync(plugin);
 		},
@@ -37,7 +35,7 @@ function buildSyncSuccessMessage(mapping: SyncMapping, result: Awaited<ReturnTyp
 async function runMappingSync(plugin: WorkflowySyncPlugin): Promise<void> {
 	const mappings = plugin.settings.mappings;
 	if (mappings.length === 0) {
-		new Notice("Add a sync mapping in Workflowy Sync settings first.");
+		new Notice("Add a sync mapping in settings first.");
 		return;
 	}
 

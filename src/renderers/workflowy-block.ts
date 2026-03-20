@@ -1,5 +1,3 @@
-/* eslint-disable obsidianmd/ui/sentence-case */
-
 import { MarkdownRenderChild, MarkdownRenderer, setIcon } from "obsidian";
 import type WorkflowySyncPlugin from "../main";
 import type { WorkflowyNode } from "../types";
@@ -41,7 +39,7 @@ export class WorkflowyBlockRenderer extends MarkdownRenderChild {
 				cls: "workflowy-sync-refresh-button",
 				attr: {
 					type: "button",
-					"aria-label": "Refresh Workflowy block",
+					"aria-label": "Refresh embedded block",
 				},
 		});
 		setIcon(refreshButton, "refresh-cw");
@@ -65,7 +63,7 @@ export class WorkflowyBlockRenderer extends MarkdownRenderChild {
 
 		const client = this.plugin.getClientOrNotice();
 		if (!client) {
-			contentEl.setText("Add your Workflowy API key in the plugin settings to render this block.");
+			contentEl.setText("Add your API key in plugin settings to render this block.");
 			statusEl.setText("Not connected");
 			return;
 		}

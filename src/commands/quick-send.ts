@@ -1,5 +1,3 @@
-/* eslint-disable obsidianmd/commands/no-plugin-id-in-command-id, obsidianmd/ui/sentence-case */
-
 import { Editor, Notice, TFile } from "obsidian";
 import type WorkflowySyncPlugin from "../main";
 import type { QuickSendPayload, WorkflowyResolvedTarget } from "../types";
@@ -7,16 +5,16 @@ import { sanitizeWorkflowyContent } from "../workflowy/markdown";
 
 export function registerQuickSendCommands(plugin: WorkflowySyncPlugin): void {
 	plugin.addCommand({
-		id: "workflowy-sync:send-to-workflowy",
-		name: "Sync: Send to Workflowy",
+		id: "send-to-workflowy",
+		name: "Workflowy: send selected text",
 		editorCallback: async () => {
 			await runQuickSend(plugin, false);
 		},
 	});
 
 	plugin.addCommand({
-		id: "workflowy-sync:send-to-workflowy-target",
-		name: "Sync: Send to Workflowy target...",
+		id: "send-to-workflowy-target",
+		name: "Workflowy: send selected text to target...",
 		editorCallback: async () => {
 			await runQuickSend(plugin, true);
 		},
@@ -34,7 +32,7 @@ async function runQuickSend(
 
 	const markdown = getMarkdownFromEditor(editorContext.editor);
 	if (!markdown.trim()) {
-		new Notice("Select some text or place your cursor on a non-empty line before sending to Workflowy.");
+		new Notice("Before sending, select some text or place your cursor on a non-empty line.");
 		return;
 	}
 
