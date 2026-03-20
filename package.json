@@ -1,7 +1,7 @@
 {
 	"name": "workflowy-sync",
 	"version": "1.0.0",
-	"description": "Quickly send content to Workflowy, embed live outlines, and sync Workflowy items with Obsidian notes.",
+	"description": "Quickly send content to Workflowy, embed live outlines, and sync Workflowy items with notes.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
