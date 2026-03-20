@@ -1,0 +1,10 @@
+{
+	"id": "workflowy-sync",
+	"name": "Workflowy Sync",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Quickly send content to Workflowy, embed live outlines, and sync Workflowy items with Obsidian notes.",
+	"author": "Rodolfo Terriquez",
+	"authorUrl": "https://github.com/rodolfo-terriquez",
+	"isDesktopOnly": false
+}
