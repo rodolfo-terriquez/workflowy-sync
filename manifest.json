@@ -1,7 +1,7 @@
 {
 	"id": "workflowy-sync",
 	"name": "Workflowy Sync",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"minAppVersion": "0.15.0",
 	"description": "Quickly send content to Workflowy, embed live outlines, and sync Workflowy items with notes.",
 	"author": "Rodolfo Terriquez",
