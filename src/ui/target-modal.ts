@@ -5,14 +5,14 @@ export interface WorkflowyTargetSuggestion {
 	title: string;
 	subtitle: string;
 	identifier: string;
-	category: "Recent" | "Shortcut" | "System" | "Custom";
+	category: "Recent" | "Shortcut" | "System" | "Node" | "Custom";
 	target?: WorkflowyResolvedTarget;
 	customInput?: string;
 }
 
 interface WorkflowyTargetModalOptions {
 	initialValue?: string;
-	suggestions: WorkflowyTargetSuggestion[];
+	getSuggestions: (query: string) => Promise<WorkflowyTargetSuggestion[]>;
 	onChoose: (suggestion: WorkflowyTargetSuggestion) => Promise<void>;
 	onCancel: () => void;
 }
@@ -20,6 +20,7 @@ interface WorkflowyTargetModalOptions {
 export class WorkflowyTargetModal extends SuggestModal<WorkflowyTargetSuggestion> {
 	private readonly options: WorkflowyTargetModalOptions;
 	private closedByChoice = false;
+	private cancelTimeoutId: number | null = null;
 
 	constructor(app: App, options: WorkflowyTargetModalOptions) {
 		super(app);
@@ -36,12 +37,8 @@ export class WorkflowyTargetModal extends SuggestModal<WorkflowyTargetSuggestion
 		}
 	}
 
-	getSuggestions(query: string): WorkflowyTargetSuggestion[] {
-		const normalizedQuery = query.trim().toLowerCase();
-		const suggestions = !normalizedQuery
-			? this.options.suggestions
-			: this.options.suggestions.filter((suggestion) => this.matchesQuery(suggestion, normalizedQuery));
-
+	async getSuggestions(query: string): Promise<WorkflowyTargetSuggestion[]> {
+		const suggestions = await this.options.getSuggestions(query);
 		const customSuggestion = this.buildCustomSuggestion(query);
 		if (!customSuggestion) {
 			return suggestions;
@@ -72,26 +69,22 @@ export class WorkflowyTargetModal extends SuggestModal<WorkflowyTargetSuggestion
 
 	onChooseSuggestion(suggestion: WorkflowyTargetSuggestion): void {
 		this.closedByChoice = true;
+		if (this.cancelTimeoutId !== null) {
+			window.clearTimeout(this.cancelTimeoutId);
+			this.cancelTimeoutId = null;
+		}
 		void this.options.onChoose(suggestion);
 		this.close();
 	}
 
 	onClose(): void {
 		super.onClose();
-		if (!this.closedByChoice) {
-			this.options.onCancel();
-		}
-	}
-
-	private matchesQuery(suggestion: WorkflowyTargetSuggestion, normalizedQuery: string): boolean {
-		const haystack = [
-			suggestion.title,
-			suggestion.subtitle,
-			suggestion.identifier,
-			suggestion.category,
-		].join(" ").toLowerCase();
-
-		return haystack.includes(normalizedQuery);
+		this.cancelTimeoutId = window.setTimeout(() => {
+			if (!this.closedByChoice) {
+				this.options.onCancel();
+			}
+			this.cancelTimeoutId = null;
+		}, 0);
 	}
 
 	private buildCustomSuggestion(query: string): WorkflowyTargetSuggestion | null {

@@ -36,16 +36,49 @@ interface WorkflowyStatusResponse {
 	status?: string;
 }
 
+interface CachedValue<TValue> {
+	value: TValue;
+	fetchedAt: number;
+}
+
+interface CachedSubtree extends CachedValue<WorkflowyNode> {
+	complete: boolean;
+}
+
+interface WorkflowySnapshotCache {
+	fetchedAt: number;
+	nodesById: Map<string, WorkflowyNode>;
+	childrenByParentId: Map<string | null, string[]>;
+	idsByShortId: Map<string, string>;
+}
+
+type WorkflowyTreeFreshness = "cache-first" | "refresh-root" | "full-snapshot";
+
+interface WorkflowyGetNodeTreeOptions {
+	forceRefresh?: boolean;
+	freshness?: WorkflowyTreeFreshness;
+	allowFullSnapshotFallback?: boolean;
+}
+
 export interface WorkflowyLlmNode {
 	ref: string;
 	name: string;
+	note: string | null;
 	layoutMode?: string;
 	completed: boolean;
+	hasMoreChildren: boolean;
 	children: WorkflowyLlmNode[];
+}
+
+export interface WorkflowyNodeSearchResult {
+	identifier: string;
+	label: string;
+	path: string;
 }
 
 export interface WorkflowyLlmInsertItem {
 	n: string;
+	d?: string;
 	l?: "todo" | "bullets";
 	x?: 0 | 1;
 	c?: WorkflowyLlmInsertItem[];
@@ -65,14 +98,23 @@ export class WorkflowyClient {
 	private static readonly minRequestIntervalMs = 1600;
 	private static readonly rateLimitRetryDelayMs = 2500;
 	private static readonly maxRateLimitRetries = 3;
+	private static readonly targetCacheTtlMs = 10 * 60 * 1000;
+	private static readonly subtreeCacheTtlMs = 45 * 1000;
+	private static readonly fullSnapshotTtlMs = 15 * 60 * 1000;
+	private static readonly fullExportCooldownMs = 65 * 1000;
+	private static readonly llmSubtreeDepth = 10;
 	private static requestQueue: Promise<void> = Promise.resolve();
 	private static lastRequestAt = 0;
+	private static lastFullExportAt = 0;
 
 	private readonly apiKey: string;
 	private readonly apiBaseUrl = "https://workflowy.com/api/v1";
 	private readonly llmBaseUrl = "https://beta.workflowy.com/api/llm/doc";
-	private cachedTargets: WorkflowyTarget[] | null = null;
-	private cachedExportedNodes: WorkflowyNode[] | null = null;
+	private cachedTargets: CachedValue<WorkflowyTarget[]> | null = null;
+	private fullSnapshotCache: WorkflowySnapshotCache | null = null;
+	private readonly cachedSubtrees = new Map<string, CachedSubtree>();
+	private readonly cachedChildrenLists = new Map<string, CachedValue<WorkflowyNode[]>>();
+	private readonly inFlightRequests = new Map<string, Promise<unknown>>();
 
 	constructor(apiKey: string) {
 		this.apiKey = apiKey.trim();
@@ -82,19 +124,65 @@ export class WorkflowyClient {
 		return await this.listTargets();
 	}
 
-	async listTargets(): Promise<WorkflowyTarget[]> {
-		if (this.cachedTargets) {
-			return this.cachedTargets;
+	primeSessionCacheInBackground(): void {
+		void this.ensureFullSnapshot({
+			allowStaleSnapshot: true,
+			reason: "startup",
+		}).catch(() => undefined);
+	}
+
+	async listTargets(options: { forceRefresh?: boolean } = {}): Promise<WorkflowyTarget[]> {
+		const now = Date.now();
+		if (!options.forceRefresh && this.cachedTargets && now - this.cachedTargets.fetchedAt < WorkflowyClient.targetCacheTtlMs) {
+			return this.cachedTargets.value;
 		}
 
-		const response = await this.requestJson<WorkflowyTargetsResponse>("/targets");
-		this.cachedTargets = response.targets;
-		return response.targets;
+		return await this.runSharedRequest("targets", async () => {
+			const response = await this.requestJson<WorkflowyTargetsResponse>("/targets");
+			this.cachedTargets = {
+				value: response.targets,
+				fetchedAt: Date.now(),
+			};
+			return response.targets;
+		});
 	}
 
 	async getTargetLabel(identifier: string): Promise<string> {
 		const resolvedTarget = await this.resolveTarget(identifier);
 		return resolvedTarget.label;
+	}
+
+	async searchCachedNodes(query: string, limit = 20): Promise<WorkflowyNodeSearchResult[]> {
+		const normalizedQuery = query.trim().toLowerCase();
+		if (!normalizedQuery) {
+			return [];
+		}
+
+		const candidates = new Map<string, WorkflowyNodeSearchResult & { score: number }>();
+		const snapshot = this.fullSnapshotCache;
+		if (snapshot) {
+			for (const node of snapshot.nodesById.values()) {
+				const result = this.scoreNodeSearchResult({
+					identifier: node.id,
+					label: node.name,
+					note: node.note,
+					path: this.buildNodePath(snapshot, node.id),
+					depth: this.getNodeDepth(snapshot, node.id),
+				}, normalizedQuery);
+				if (result) {
+					candidates.set(result.identifier, result);
+				}
+			}
+		}
+
+		for (const cachedSubtree of this.cachedSubtrees.values()) {
+			this.collectSearchResultsFromTree(cachedSubtree.value, normalizedQuery, candidates, []);
+		}
+
+		return Array.from(candidates.values())
+			.sort((left, right) => right.score - left.score || left.label.localeCompare(right.label))
+			.slice(0, limit)
+			.map(({ score: _score, ...result }) => result);
 	}
 
 	async resolveTarget(rawIdentifier: string): Promise<WorkflowyResolvedTarget> {
@@ -120,57 +208,61 @@ export class WorkflowyClient {
 
 	async getNode(rawIdentifier: string): Promise<WorkflowyNode> {
 		const identifier = await this.resolveNodeIdentifier(rawIdentifier);
-		const response = await this.requestJson<WorkflowyNodeResponse>(`/nodes/${encodeURIComponent(identifier)}`);
-		return response.node;
+		const subtree = this.getCachedSubtree(identifier, { requireFresh: false });
+		if (subtree) {
+			return this.cloneNode(subtree.value);
+		}
+
+		const snapshotNode = this.getNodeFromSnapshot(identifier);
+		if (snapshotNode) {
+			return this.cloneNode(snapshotNode);
+		}
+
+		return await this.fetchSingleNode(identifier, { forceRefresh: false });
 	}
 
-	async listNodes(rawParentIdentifier: string): Promise<WorkflowyNode[]> {
+	async listNodes(
+		rawParentIdentifier: string,
+		options: { forceRefresh?: boolean } = {},
+	): Promise<WorkflowyNode[]> {
 		const parentIdentifier = normalizeWorkflowyIdentifier(rawParentIdentifier);
-		const query = new URLSearchParams({
-			parent_id: parentIdentifier,
+		const cacheKey = this.getChildrenCacheKey(parentIdentifier);
+		const now = Date.now();
+		const cachedChildren = this.cachedChildrenLists.get(cacheKey);
+		if (!options.forceRefresh && cachedChildren && now - cachedChildren.fetchedAt < WorkflowyClient.subtreeCacheTtlMs) {
+			return cachedChildren.value.map((node) => this.cloneNode(node));
+		}
+
+		return await this.runSharedRequest(`children:${cacheKey}`, async () => {
+			const query = new URLSearchParams({
+				parent_id: parentIdentifier,
+			});
+			const response = await this.requestJson<WorkflowyListNodesResponse>(`/nodes?${query.toString()}`);
+			const children = [...response.nodes].sort((left, right) => left.priority - right.priority);
+			this.cachedChildrenLists.set(cacheKey, {
+				value: children,
+				fetchedAt: Date.now(),
+			});
+			this.replaceChildrenInSnapshot(parentIdentifier === "None" ? null : parentIdentifier, children);
+			return children.map((node) => this.cloneNode(node));
 		});
-		const response = await this.requestJson<WorkflowyListNodesResponse>(`/nodes?${query.toString()}`);
-		return [...response.nodes].sort((left, right) => left.priority - right.priority);
 	}
 
-	async getNodeTree(rawIdentifier: string, options: { forceRefresh?: boolean } = {}): Promise<WorkflowyNode> {
+	async getNodeTree(
+		rawIdentifier: string,
+		options: WorkflowyGetNodeTreeOptions = {},
+	): Promise<WorkflowyNode> {
 		const identifier = normalizeWorkflowyIdentifier(rawIdentifier);
-		const exportedNodes = await this.exportAllNodes(options.forceRefresh);
-		const nodeIndex = this.createNodeIndex(exportedNodes);
+		const freshness = options.freshness ?? (options.forceRefresh ? "refresh-root" : "cache-first");
+		const allowFullSnapshotFallback = options.allowFullSnapshotFallback ?? true;
 		const targets = await this.listTargets();
 		const matchingTarget = targets.find((target) => target.key.toLowerCase() === identifier.toLowerCase());
 
 		if (matchingTarget) {
-			const directChildren = await this.listNodes(matchingTarget.key);
-			const children = directChildren.map((child) => this.cloneNodeTree(nodeIndex, child));
-			return {
-				id: matchingTarget.key,
-				name: formatTargetLabel(matchingTarget.key, matchingTarget.name),
-				note: null,
-				priority: 0,
-				parent_id: null,
-				data: {
-					layoutMode: "bullets",
-				},
-				createdAt: 0,
-				modifiedAt: 0,
-				completedAt: null,
-				children,
-			};
+			return await this.getTargetTree(matchingTarget, freshness, allowFullSnapshotFallback);
 		}
 
-		const resolvedNodeId = await this.resolveNodeIdentifier(identifier);
-		const rootNode = nodeIndex.get(resolvedNodeId);
-		if (rootNode) {
-			return this.cloneNodeTree(nodeIndex, rootNode);
-		}
-
-		const fetchedNode = await this.getNode(resolvedNodeId);
-		const children = await this.listNodes(fetchedNode.id);
-		return {
-			...fetchedNode,
-			children,
-		};
+		return await this.getNodeRootTree(identifier, freshness, allowFullSnapshotFallback);
 	}
 
 	async createNode(options: {
@@ -195,7 +287,8 @@ export class WorkflowyClient {
 			throw new Error("Workflowy did not return a node ID for the created item.");
 		}
 
-		this.invalidateCaches();
+		this.invalidateSubtreeCaches();
+		void this.refreshNodeChildren(payload.parent_id).catch(() => undefined);
 		return response.item_id;
 	}
 
@@ -218,28 +311,36 @@ export class WorkflowyClient {
 			throw new Error("Workflowy did not confirm the node update.");
 		}
 
-		this.invalidateCaches();
+		this.invalidateSubtreeCaches();
+		void this.refreshNode(options.id).catch(() => undefined);
 	}
 
 	async completeNode(id: string): Promise<void> {
 		await this.requestBetaStatus("/complete-item/", {
 			item_id: id,
 		});
-		this.invalidateCaches();
+		this.invalidateSubtreeCaches();
+		void this.refreshNode(id).catch(() => undefined);
 	}
 
 	async uncompleteNode(id: string): Promise<void> {
 		await this.requestBetaStatus("/uncomplete-item/", {
 			item_id: id,
 		});
-		this.invalidateCaches();
+		this.invalidateSubtreeCaches();
+		void this.refreshNode(id).catch(() => undefined);
 	}
 
 	async deleteNode(id: string): Promise<void> {
+		const parentId = this.findCachedParentId(id);
 		await this.requestBetaStatus("/delete-item/", {
 			item_id: id,
 		});
-		this.invalidateCaches();
+		this.removeNodeFromSnapshot(id);
+		this.invalidateSubtreeCaches();
+		if (parentId) {
+			void this.refreshNodeChildren(parentId).catch(() => undefined);
+		}
 	}
 
 	async readLlmDocument(rawIdentifier: string, depth = 1): Promise<WorkflowyLlmNode> {
@@ -263,7 +364,639 @@ export class WorkflowyClient {
 				operations,
 			},
 		});
-		this.invalidateCaches();
+		this.invalidateSubtreeCaches();
+		this.markSnapshotStale();
+	}
+
+	private async getNodeRootTree(
+		identifier: string,
+		freshness: WorkflowyTreeFreshness,
+		allowFullSnapshotFallback: boolean,
+	): Promise<WorkflowyNode> {
+		if (freshness === "cache-first") {
+			const cachedSubtree = this.getCachedSubtree(identifier, { requireFresh: true });
+			if (cachedSubtree) {
+				return this.cloneNode(cachedSubtree.value);
+			}
+
+			const staleSubtree = this.getCachedSubtree(identifier, { requireFresh: false });
+			if (staleSubtree) {
+				void this.fetchAndCacheSubtree(identifier).catch(() => undefined);
+				return this.cloneNode(staleSubtree.value);
+			}
+
+			const snapshotTree = await this.getTreeFromSnapshot(identifier, { refreshIfStale: false });
+			if (snapshotTree) {
+				void this.fetchAndCacheSubtree(identifier).catch(() => undefined);
+				return snapshotTree;
+			}
+		}
+
+		try {
+			const subtreeResult = await this.fetchAndCacheSubtree(identifier);
+			if (subtreeResult.complete || !allowFullSnapshotFallback) {
+				return this.cloneNode(subtreeResult.root);
+			}
+		} catch {
+			const cachedSubtree = this.getCachedSubtree(identifier, { requireFresh: false });
+			if (cachedSubtree) {
+				return this.cloneNode(cachedSubtree.value);
+			}
+		}
+
+		if (allowFullSnapshotFallback) {
+			const snapshotTree = await this.getTreeFromSnapshot(identifier, {
+				refreshIfStale: freshness !== "cache-first",
+			});
+			if (snapshotTree) {
+				return snapshotTree;
+			}
+		}
+
+		const cachedSubtree = this.getCachedSubtree(identifier, { requireFresh: false });
+		if (cachedSubtree) {
+			return this.cloneNode(cachedSubtree.value);
+		}
+
+		const fetchedNode = await this.fetchSingleNode(identifier, { forceRefresh: freshness !== "cache-first" });
+		const children = await this.listNodes(fetchedNode.id, { forceRefresh: freshness !== "cache-first" });
+		return {
+			...fetchedNode,
+			children,
+		};
+	}
+
+	private async getTargetTree(
+		target: WorkflowyTarget,
+		freshness: WorkflowyTreeFreshness,
+		allowFullSnapshotFallback: boolean,
+	): Promise<WorkflowyNode> {
+		if (freshness === "cache-first") {
+			const cachedSubtree = this.getCachedSubtree(target.key, { requireFresh: true });
+			if (cachedSubtree) {
+				return this.normalizeTargetRoot(target, cachedSubtree.value);
+			}
+
+			const staleSubtree = this.getCachedSubtree(target.key, { requireFresh: false });
+			if (staleSubtree) {
+				void this.fetchAndCacheSubtree(target.key).catch(() => undefined);
+				return this.normalizeTargetRoot(target, staleSubtree.value);
+			}
+		}
+
+		try {
+			const subtreeResult = await this.fetchAndCacheSubtree(target.key);
+			if (subtreeResult.complete || !allowFullSnapshotFallback) {
+				return this.normalizeTargetRoot(target, subtreeResult.root);
+			}
+		} catch {
+			const cachedSubtree = this.getCachedSubtree(target.key, { requireFresh: false });
+			if (cachedSubtree) {
+				return this.normalizeTargetRoot(target, cachedSubtree.value);
+			}
+		}
+
+		const directChildren = await this.listNodes(target.key, { forceRefresh: freshness !== "cache-first" });
+		return {
+			id: target.key,
+			name: formatTargetLabel(target.key, target.name),
+			note: null,
+			priority: 0,
+			parent_id: null,
+			data: {
+				layoutMode: "bullets",
+			},
+			createdAt: 0,
+			modifiedAt: 0,
+			completedAt: null,
+			children: directChildren.map((child) => this.cloneNode(child)),
+		};
+	}
+
+	private normalizeTargetRoot(target: WorkflowyTarget, subtreeRoot: WorkflowyNode): WorkflowyNode {
+		return {
+			...this.cloneNode(subtreeRoot),
+			id: target.key,
+			name: formatTargetLabel(target.key, target.name),
+			parent_id: null,
+		};
+	}
+
+	private getCachedSubtree(
+		identifier: string,
+		options: { requireFresh: boolean },
+	): CachedSubtree | null {
+		const now = Date.now();
+		for (const cacheKey of this.getSubtreeLookupKeys(identifier)) {
+			const cachedSubtree = this.cachedSubtrees.get(cacheKey);
+			if (!cachedSubtree) {
+				continue;
+			}
+			if (!options.requireFresh || now - cachedSubtree.fetchedAt < WorkflowyClient.subtreeCacheTtlMs) {
+				return cachedSubtree;
+			}
+		}
+
+		return null;
+	}
+
+	private getSubtreeLookupKeys(identifier: string): string[] {
+		const normalizedIdentifier = normalizeWorkflowyIdentifier(identifier);
+		const keys = new Set<string>([normalizedIdentifier]);
+		if (isWorkflowyFullNodeId(normalizedIdentifier)) {
+			keys.add(normalizedIdentifier.slice(-12).toLowerCase());
+		}
+		if (isWorkflowyShortNodeId(normalizedIdentifier)) {
+			keys.add(stripWorkflowyShortNodePrefix(normalizedIdentifier).toLowerCase());
+		}
+		return [...keys];
+	}
+
+	private cacheSubtree(identifier: string, subtree: WorkflowyNode, complete: boolean): void {
+		const cachedSubtree: CachedSubtree = {
+			value: this.cloneNode(subtree),
+			fetchedAt: Date.now(),
+			complete,
+		};
+
+		for (const cacheKey of this.getSubtreeLookupKeys(identifier)) {
+			this.cachedSubtrees.set(cacheKey, cachedSubtree);
+		}
+		for (const cacheKey of this.getSubtreeLookupKeys(subtree.id)) {
+			this.cachedSubtrees.set(cacheKey, cachedSubtree);
+		}
+	}
+
+	private invalidateSubtreeCaches(): void {
+		this.cachedSubtrees.clear();
+	}
+
+	private markSnapshotStale(): void {
+		if (!this.fullSnapshotCache) {
+			return;
+		}
+
+		this.fullSnapshotCache = {
+			...this.fullSnapshotCache,
+			fetchedAt: 0,
+		};
+	}
+
+	private async fetchAndCacheSubtree(identifier: string): Promise<{ root: WorkflowyNode; complete: boolean }> {
+		return await this.runSharedRequest(`subtree:${identifier}`, async () => {
+			const llmRoot = await this.readLlmDocument(identifier, WorkflowyClient.llmSubtreeDepth);
+			const subtreeRoot = this.buildWorkflowyTreeFromLlm(identifier, llmRoot, null, true);
+			const complete = !this.llmTreeHasTruncation(llmRoot);
+			this.cacheSubtree(identifier, subtreeRoot, complete);
+			return {
+				root: subtreeRoot,
+				complete,
+			};
+		});
+	}
+
+	private buildWorkflowyTreeFromLlm(
+		requestedIdentifier: string,
+		node: WorkflowyLlmNode,
+		parentId: string | null,
+		isRoot: boolean,
+	): WorkflowyNode {
+		const normalizedRequestedIdentifier = normalizeWorkflowyIdentifier(requestedIdentifier);
+		const nodeId = isRoot && isWorkflowyFullNodeId(normalizedRequestedIdentifier)
+			? normalizedRequestedIdentifier
+			: node.ref;
+		const workflowyNode: WorkflowyNode = {
+			id: nodeId,
+			name: node.name,
+			note: node.note,
+			priority: 0,
+			parent_id: parentId,
+			data: {
+				layoutMode: node.layoutMode,
+			},
+			createdAt: 0,
+			modifiedAt: 0,
+			completedAt: node.completed ? 1 : null,
+			completed: node.completed,
+			children: [],
+		};
+
+		workflowyNode.children = node.children.map((child, index) => ({
+			...this.buildWorkflowyTreeFromLlm(child.ref, child, workflowyNode.id, false),
+			priority: index,
+		}));
+		return workflowyNode;
+	}
+
+	private llmTreeHasTruncation(node: WorkflowyLlmNode): boolean {
+		if (node.hasMoreChildren) {
+			return true;
+		}
+
+		return node.children.some((child) => this.llmTreeHasTruncation(child));
+	}
+
+	private async ensureFullSnapshot(options: {
+		allowStaleSnapshot: boolean;
+		refreshIfStale?: boolean;
+		reason: string;
+	}): Promise<WorkflowySnapshotCache | null> {
+		const snapshotFresh = Boolean(
+			this.fullSnapshotCache
+			&& Date.now() - this.fullSnapshotCache.fetchedAt < WorkflowyClient.fullSnapshotTtlMs,
+		);
+		if (snapshotFresh) {
+			return this.fullSnapshotCache;
+		}
+
+		if (!options.refreshIfStale && this.fullSnapshotCache) {
+			return this.fullSnapshotCache;
+		}
+
+		try {
+			return await this.runSharedRequest("full-snapshot", async () => {
+				const now = Date.now();
+				const waitMs = Math.max(0, WorkflowyClient.fullExportCooldownMs - (now - WorkflowyClient.lastFullExportAt));
+				if (waitMs > 0) {
+					await this.sleep(waitMs);
+				}
+
+				const response = await this.requestJson<WorkflowyNodesExportResponse>("/nodes-export");
+				WorkflowyClient.lastFullExportAt = Date.now();
+				this.fullSnapshotCache = this.buildSnapshotCache(response.nodes);
+				return this.fullSnapshotCache;
+			});
+		} catch {
+			if (options.allowStaleSnapshot && this.fullSnapshotCache) {
+				return this.fullSnapshotCache;
+			}
+			return null;
+		}
+	}
+
+	private buildSnapshotCache(flatNodes: WorkflowyNode[]): WorkflowySnapshotCache {
+		const nodesById = new Map<string, WorkflowyNode>();
+		const childrenByParentId = new Map<string | null, string[]>();
+		const idsByShortId = new Map<string, string>();
+
+		for (const node of flatNodes) {
+			nodesById.set(node.id, {
+				...node,
+				children: [],
+			});
+			const shortId = this.getShortIdKey(node.id);
+			if (shortId) {
+				idsByShortId.set(shortId, node.id);
+			}
+		}
+
+		for (const node of flatNodes) {
+			const parentId = node.parent_id ?? null;
+			const siblingIds = childrenByParentId.get(parentId) ?? [];
+			siblingIds.push(node.id);
+			childrenByParentId.set(parentId, siblingIds);
+		}
+
+		for (const siblingIds of childrenByParentId.values()) {
+			siblingIds.sort((leftId, rightId) => {
+				const leftNode = nodesById.get(leftId);
+				const rightNode = nodesById.get(rightId);
+				return (leftNode?.priority ?? 0) - (rightNode?.priority ?? 0);
+			});
+		}
+
+		return {
+			fetchedAt: Date.now(),
+			nodesById,
+			childrenByParentId,
+			idsByShortId,
+		};
+	}
+
+	private async getTreeFromSnapshot(
+		identifier: string,
+		options: { refreshIfStale: boolean },
+	): Promise<WorkflowyNode | null> {
+		const snapshot = await this.ensureFullSnapshot({
+			allowStaleSnapshot: true,
+			refreshIfStale: options.refreshIfStale,
+			reason: `tree:${identifier}`,
+		});
+		if (!snapshot) {
+			return null;
+		}
+
+		const snapshotId = this.resolveSnapshotNodeId(identifier);
+		if (!snapshotId) {
+			return null;
+		}
+
+		return this.cloneNodeTreeFromSnapshot(snapshot, snapshotId);
+	}
+
+	private resolveSnapshotNodeId(identifier: string): string | null {
+		const normalizedIdentifier = normalizeWorkflowyIdentifier(identifier);
+		if (this.fullSnapshotCache?.nodesById.has(normalizedIdentifier)) {
+			return normalizedIdentifier;
+		}
+
+		const shortId = this.getShortIdKey(normalizedIdentifier);
+		if (!shortId) {
+			return null;
+		}
+
+		return this.fullSnapshotCache?.idsByShortId.get(shortId) ?? null;
+	}
+
+	private getNodeFromSnapshot(identifier: string): WorkflowyNode | null {
+		const snapshotId = this.resolveSnapshotNodeId(identifier);
+		if (!snapshotId) {
+			return null;
+		}
+		const node = this.fullSnapshotCache?.nodesById.get(snapshotId);
+		return node ? this.cloneNode(node) : null;
+	}
+
+	private cloneNodeTreeFromSnapshot(snapshot: WorkflowySnapshotCache, nodeId: string): WorkflowyNode | null {
+		const node = snapshot.nodesById.get(nodeId);
+		if (!node) {
+			return null;
+		}
+
+		const childIds = snapshot.childrenByParentId.get(node.id) ?? [];
+		return {
+			...node,
+			children: childIds
+				.map((childId) => this.cloneNodeTreeFromSnapshot(snapshot, childId))
+				.filter((child): child is WorkflowyNode => child !== null),
+		};
+	}
+
+	private buildNodePath(snapshot: WorkflowySnapshotCache, nodeId: string): string {
+		const parts: string[] = [];
+		let currentId: string | null = nodeId;
+		while (currentId) {
+			const currentNode = snapshot.nodesById.get(currentId);
+			if (!currentNode) {
+				break;
+			}
+			parts.unshift(currentNode.name.trim() || currentNode.id);
+			currentId = currentNode.parent_id ?? null;
+		}
+
+		return parts.join(" > ");
+	}
+
+	private scoreNodeSearchResult(
+		node: {
+			identifier: string;
+			label: string;
+			note: string | null;
+			path: string;
+			depth: number;
+		},
+		normalizedQuery: string,
+	): (WorkflowyNodeSearchResult & { score: number }) | null {
+		const label = node.label.trim();
+		const note = node.note?.trim() ?? "";
+		const haystack = `${label}\n${note}`.toLowerCase();
+		if (!haystack.includes(normalizedQuery)) {
+			return null;
+		}
+
+		let score = 0;
+		if (label.toLowerCase() === normalizedQuery) {
+			score += 120;
+		} else if (label.toLowerCase().startsWith(normalizedQuery)) {
+			score += 90;
+		} else if (label.toLowerCase().includes(normalizedQuery)) {
+			score += 60;
+		} else {
+			score += 25;
+		}
+		if (note.toLowerCase().includes(normalizedQuery)) {
+			score += 10;
+		}
+		score -= node.depth;
+
+		return {
+			identifier: node.identifier,
+			label: label || node.identifier,
+			path: node.path,
+			score,
+		};
+	}
+
+	private collectSearchResultsFromTree(
+		node: WorkflowyNode,
+		normalizedQuery: string,
+		results: Map<string, WorkflowyNodeSearchResult & { score: number }>,
+		ancestorLabels: string[],
+	): void {
+		const result = this.scoreNodeSearchResult({
+			identifier: node.id,
+			label: node.name,
+			note: node.note,
+			path: [...ancestorLabels, node.name.trim() || node.id].join(" > "),
+			depth: ancestorLabels.length,
+		}, normalizedQuery);
+		if (result) {
+			const existingResult = results.get(result.identifier);
+			if (!existingResult || result.score > existingResult.score) {
+				results.set(result.identifier, result);
+			}
+		}
+
+		const nextAncestorLabels = [...ancestorLabels, node.name.trim() || node.id];
+		for (const child of node.children ?? []) {
+			this.collectSearchResultsFromTree(child, normalizedQuery, results, nextAncestorLabels);
+		}
+	}
+
+	private getNodeDepth(snapshot: WorkflowySnapshotCache, nodeId: string): number {
+		let depth = 0;
+		let currentId = nodeId;
+		while (true) {
+			const currentNode = snapshot.nodesById.get(currentId);
+			const parentId = currentNode?.parent_id ?? null;
+			if (!parentId) {
+				return depth;
+			}
+			depth += 1;
+			currentId = parentId;
+		}
+	}
+
+	private replaceChildrenInSnapshot(parentId: string | null, children: WorkflowyNode[]): void {
+		const snapshot = this.ensureSnapshotCache();
+		const normalizedParentId = parentId ?? null;
+		const existingChildIds = snapshot.childrenByParentId.get(normalizedParentId) ?? [];
+		const nextChildIds = children.map((child) => child.id);
+		const nextChildIdSet = new Set(nextChildIds);
+
+		for (const existingChildId of existingChildIds) {
+			if (!nextChildIdSet.has(existingChildId)) {
+				this.removeNodeAndDescendantsFromSnapshot(snapshot, existingChildId);
+			}
+		}
+
+		snapshot.childrenByParentId.set(normalizedParentId, nextChildIds);
+		for (const child of children) {
+			this.upsertNodeInSnapshot(snapshot, child, normalizedParentId);
+		}
+		snapshot.fetchedAt = Date.now();
+	}
+
+	private upsertNodeInSnapshot(
+		snapshot: WorkflowySnapshotCache,
+		node: WorkflowyNode,
+		parentIdOverride?: string | null,
+	): void {
+		const existingNode = snapshot.nodesById.get(node.id);
+		const normalizedParentId = parentIdOverride !== undefined ? parentIdOverride : (node.parent_id ?? existingNode?.parent_id ?? null);
+		snapshot.nodesById.set(node.id, {
+			...existingNode,
+			...node,
+			parent_id: normalizedParentId,
+			children: [],
+		});
+
+		const shortId = this.getShortIdKey(node.id);
+		if (shortId) {
+			snapshot.idsByShortId.set(shortId, node.id);
+		}
+	}
+
+	private ensureSnapshotCache(): WorkflowySnapshotCache {
+		if (!this.fullSnapshotCache) {
+			this.fullSnapshotCache = {
+				fetchedAt: 0,
+				nodesById: new Map<string, WorkflowyNode>(),
+				childrenByParentId: new Map<string | null, string[]>(),
+				idsByShortId: new Map<string, string>(),
+			};
+		}
+
+		return this.fullSnapshotCache;
+	}
+
+	private removeNodeFromSnapshot(identifier: string): void {
+		if (!this.fullSnapshotCache) {
+			return;
+		}
+
+		const snapshotId = this.resolveSnapshotNodeId(identifier) ?? identifier;
+		this.removeNodeAndDescendantsFromSnapshot(this.fullSnapshotCache, snapshotId);
+		for (const [parentId, childIds] of this.fullSnapshotCache.childrenByParentId.entries()) {
+			if (!childIds.includes(snapshotId)) {
+				continue;
+			}
+			this.fullSnapshotCache.childrenByParentId.set(parentId, childIds.filter((childId) => childId !== snapshotId));
+		}
+	}
+
+	private removeNodeAndDescendantsFromSnapshot(snapshot: WorkflowySnapshotCache, nodeId: string): void {
+		const childIds = snapshot.childrenByParentId.get(nodeId) ?? [];
+		for (const childId of childIds) {
+			this.removeNodeAndDescendantsFromSnapshot(snapshot, childId);
+		}
+
+		snapshot.childrenByParentId.delete(nodeId);
+		const shortId = this.getShortIdKey(nodeId);
+		if (shortId) {
+			snapshot.idsByShortId.delete(shortId);
+		}
+		snapshot.nodesById.delete(nodeId);
+	}
+
+	private async refreshNode(identifier: string): Promise<void> {
+		await this.runSharedRequest(`refresh-node:${identifier}`, async () => {
+			const node = await this.fetchSingleNode(identifier, { forceRefresh: true });
+			const snapshot = this.ensureSnapshotCache();
+			this.upsertNodeInSnapshot(snapshot, node);
+			snapshot.fetchedAt = Date.now();
+		});
+	}
+
+	private async refreshNodeChildren(parentIdentifier: string): Promise<void> {
+		const normalizedParentIdentifier = normalizeWorkflowyIdentifier(parentIdentifier);
+		await this.runSharedRequest(`refresh-children:${normalizedParentIdentifier}`, async () => {
+			const children = await this.listNodes(normalizedParentIdentifier, { forceRefresh: true });
+			this.replaceChildrenInSnapshot(normalizedParentIdentifier === "None" ? null : normalizedParentIdentifier, children);
+		});
+	}
+
+	private findCachedParentId(identifier: string): string | null {
+		const normalizedIdentifier = normalizeWorkflowyIdentifier(identifier);
+		const snapshotId = this.resolveSnapshotNodeId(normalizedIdentifier);
+		if (snapshotId) {
+			return this.fullSnapshotCache?.nodesById.get(snapshotId)?.parent_id ?? null;
+		}
+
+		const subtreeNode = this.findNodeInCachedSubtrees(normalizedIdentifier);
+		return subtreeNode?.parent_id ?? null;
+	}
+
+	private findNodeInCachedSubtrees(identifier: string): WorkflowyNode | null {
+		for (const cachedSubtree of this.cachedSubtrees.values()) {
+			const matchingNode = this.findNodeInTree(cachedSubtree.value, identifier);
+			if (matchingNode) {
+				return matchingNode;
+			}
+		}
+		return null;
+	}
+
+	private findNodeInTree(rootNode: WorkflowyNode, identifier: string): WorkflowyNode | null {
+		if (rootNode.id === identifier) {
+			return rootNode;
+		}
+		const shortId = this.getShortIdKey(identifier);
+		if (shortId && this.getShortIdKey(rootNode.id) === shortId) {
+			return rootNode;
+		}
+		for (const child of rootNode.children ?? []) {
+			const matchingChild = this.findNodeInTree(child, identifier);
+			if (matchingChild) {
+				return matchingChild;
+			}
+		}
+		return null;
+	}
+
+	private getShortIdKey(identifier: string): string | null {
+		if (isWorkflowyFullNodeId(identifier)) {
+			return identifier.slice(-12).toLowerCase();
+		}
+		if (isWorkflowyShortNodeId(identifier)) {
+			return stripWorkflowyShortNodePrefix(identifier).toLowerCase();
+		}
+		return null;
+	}
+
+	private getChildrenCacheKey(parentIdentifier: string): string {
+		return normalizeWorkflowyIdentifier(parentIdentifier);
+	}
+
+	private async fetchSingleNode(
+		rawIdentifier: string,
+		options: { forceRefresh: boolean },
+	): Promise<WorkflowyNode> {
+		const identifier = await this.resolveNodeIdentifier(rawIdentifier);
+		if (!options.forceRefresh) {
+			const snapshotNode = this.getNodeFromSnapshot(identifier);
+			if (snapshotNode) {
+				return snapshotNode;
+			}
+		}
+
+		return await this.runSharedRequest(`node:${identifier}`, async () => {
+			const response = await this.requestJson<WorkflowyNodeResponse>(`/nodes/${encodeURIComponent(identifier)}`);
+			const snapshot = this.ensureSnapshotCache();
+			this.upsertNodeInSnapshot(snapshot, response.node);
+			snapshot.fetchedAt = Date.now();
+			return response.node;
+		});
 	}
 
 	private async requestJson<TResponse>(
@@ -375,39 +1108,17 @@ export class WorkflowyClient {
 		}
 
 		const shortIdentifier = stripWorkflowyShortNodePrefix(identifier).toLowerCase();
-		const matchingNode = await this.findNodeByShortIdentifier(shortIdentifier);
-		if (matchingNode) {
-			return matchingNode.id;
-		}
-
 		const directIdentifier = await this.tryResolveNodeIdentifierDirectly(identifier, shortIdentifier);
 		if (directIdentifier) {
 			return directIdentifier;
 		}
 
+		const snapshotMatch = this.fullSnapshotCache?.idsByShortId.get(shortIdentifier);
+		if (snapshotMatch) {
+			return snapshotMatch;
+		}
+
 		throw new Error("Could not resolve that Workflowy item URL. Try copying the item URL again or choose it from the picker.");
-	}
-
-	private async findNodeByShortIdentifier(shortIdentifier: string): Promise<WorkflowyNode | null> {
-		for (const forceRefresh of [false, true]) {
-			const exportedNodes = await this.exportAllNodes(forceRefresh);
-			const matchingNode = exportedNodes.find((node) => node.id.toLowerCase().endsWith(shortIdentifier));
-			if (matchingNode) {
-				return matchingNode;
-			}
-		}
-
-		return null;
-	}
-
-	private async exportAllNodes(forceRefresh = false): Promise<WorkflowyNode[]> {
-		if (!forceRefresh && this.cachedExportedNodes) {
-			return this.cachedExportedNodes;
-		}
-
-		const response = await this.requestJson<WorkflowyNodesExportResponse>("/nodes-export");
-		this.cachedExportedNodes = response.nodes;
-		return response.nodes;
 	}
 
 	private async tryResolveNodeIdentifierDirectly(
@@ -448,7 +1159,7 @@ export class WorkflowyClient {
 	}
 
 	private parseLlmNode(value: Record<string, unknown>): WorkflowyLlmNode {
-		const reservedKeys = new Set(["c", "l", "x", "m", "+", "ancestors"]);
+		const reservedKeys = new Set(["c", "d", "l", "x", "m", "+", "ancestors"]);
 		const rootEntry = Object.entries(value).find(([key, entryValue]) => !reservedKeys.has(key) && typeof entryValue === "string");
 		if (!rootEntry) {
 			throw new Error("Workflowy LLM API returned an unexpected document shape.");
@@ -460,12 +1171,27 @@ export class WorkflowyClient {
 		return {
 			ref,
 			name: String(rawName),
+			note: typeof value.d === "string" ? value.d : null,
 			layoutMode: typeof value.l === "string" ? value.l : undefined,
 			completed: value.x === 1,
+			hasMoreChildren: value["+"] === 1,
 			children: childValues
 				.filter((child): child is Record<string, unknown> => typeof child === "object" && child !== null)
 				.map((child) => this.parseLlmNode(child)),
 		};
+	}
+
+	private async runSharedRequest<TResponse>(requestKey: string, callback: () => Promise<TResponse>): Promise<TResponse> {
+		const inFlightRequest = this.inFlightRequests.get(requestKey) as Promise<TResponse> | undefined;
+		if (inFlightRequest) {
+			return await inFlightRequest;
+		}
+
+		const requestPromise = callback().finally(() => {
+			this.inFlightRequests.delete(requestKey);
+		});
+		this.inFlightRequests.set(requestKey, requestPromise as Promise<unknown>);
+		return await requestPromise;
 	}
 
 	private async enqueueRequest<TResponse>(callback: () => Promise<TResponse>): Promise<TResponse> {
@@ -498,55 +1224,11 @@ export class WorkflowyClient {
 		);
 	}
 
-	private createNodeIndex(flatNodes: WorkflowyNode[]): Map<string, WorkflowyNode> {
-		const nodeIndex = new Map<string, WorkflowyNode>();
-		const childrenIndex = new Map<string | null, WorkflowyNode[]>();
-
-		for (const node of flatNodes) {
-			nodeIndex.set(node.id, {
-				...node,
-				children: [],
-			});
-		}
-
-		for (const node of flatNodes) {
-			const parentId = node.parent_id ?? null;
-			const siblings = childrenIndex.get(parentId) ?? [];
-			siblings.push(node);
-			childrenIndex.set(parentId, siblings);
-		}
-
-		for (const [parentId, children] of childrenIndex.entries()) {
-			if (!parentId) {
-				continue;
-			}
-
-			const parentNode = nodeIndex.get(parentId);
-			if (!parentNode) {
-				continue;
-			}
-
-			parentNode.children = [...children]
-				.sort((left, right) => left.priority - right.priority)
-				.map((child) => nodeIndex.get(child.id) ?? {
-					...child,
-					children: [],
-				});
-		}
-
-		return nodeIndex;
-	}
-
-	private cloneNodeTree(nodeIndex: Map<string, WorkflowyNode>, node: WorkflowyNode): WorkflowyNode {
-		const indexedNode = nodeIndex.get(node.id) ?? node;
+	private cloneNode(node: WorkflowyNode): WorkflowyNode {
 		return {
-			...indexedNode,
-			children: (indexedNode.children ?? []).map((child) => this.cloneNodeTree(nodeIndex, child)),
+			...node,
+			children: (node.children ?? []).map((child) => this.cloneNode(child)),
 		};
-	}
-
-	private invalidateCaches(): void {
-		this.cachedExportedNodes = null;
 	}
 
 	private sleep(durationMs: number): Promise<void> {

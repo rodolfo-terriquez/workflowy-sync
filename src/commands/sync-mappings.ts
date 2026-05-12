@@ -6,7 +6,7 @@ import { WorkflowyMappingPickerModal } from "../sync/mapping-picker-modal";
 export function registerSyncCommands(plugin: WorkflowySyncPlugin): void {
 	plugin.addCommand({
 		id: "sync-mapping-now",
-		name: "Workflowy: run sync mapping",
+		name: "Sync mapping…",
 		callback: async () => {
 			await runMappingSync(plugin);
 		},

@@ -69,7 +69,10 @@ export class WorkflowyBlockRenderer extends MarkdownRenderChild {
 		}
 
 		try {
-			const rootNode = await client.getNodeTree(config.node, { forceRefresh });
+			const rootNode = await client.getNodeTree(config.node, {
+				freshness: forceRefresh ? "refresh-root" : "cache-first",
+				allowFullSnapshotFallback: false,
+			});
 			statusEl.setText(`Updated ${new Date().toLocaleTimeString()}`);
 			await this.renderTree(rootNode, contentEl);
 		} catch (error) {

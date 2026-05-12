@@ -14,7 +14,9 @@ export async function syncMappingToNote(
 		throw new Error("Missing Workflowy API key");
 	}
 
-	const rootNode = await client.getNodeTree(mapping.wfNodeId, { forceRefresh: true });
+	const rootNode = await client.getNodeTree(mapping.wfNodeId, {
+		freshness: options.allowOverwritePrompt === false ? "cache-first" : "refresh-root",
+	});
 	const filteredRootNode = applyCompletedFilter(rootNode, mapping.filter.includeCompleted ?? true);
 	const notePath = normalizePath(mapping.obsidianPath);
 	const existingFile = plugin.app.vault.getAbstractFileByPath(notePath);

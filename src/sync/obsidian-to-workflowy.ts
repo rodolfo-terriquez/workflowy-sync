@@ -37,7 +37,9 @@ export async function syncObsidianToWorkflowy(
 	}
 
 	const noteContent = await plugin.app.vault.cachedRead(noteFile);
-	const rootNode = await client.getNodeTree(mapping.wfNodeId, { forceRefresh: true });
+	const rootNode = await client.getNodeTree(mapping.wfNodeId, {
+		freshness: options.allowOverwritePrompt === false ? "cache-first" : "refresh-root",
+	});
 	const sourceMarkdown = extractSourceMarkdown(noteContent, mapping.obsidianSectionHeading);
 	const desiredRoot = parseMarkdownToWorkflowyTree(
 		sourceMarkdown,
@@ -75,7 +77,7 @@ async function syncDraftNodeToWorkflowy(
 		return;
 	}
 
-	const refreshedNode = await client.getNodeTree(existingNode.id, { forceRefresh: true });
+	const refreshedNode = await client.getNodeTree(existingNode.id, { freshness: "refresh-root" });
 	await syncDraftMetadataRecursively(client, refreshedNode, desiredNode, isRoot);
 }
 

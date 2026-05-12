@@ -6,7 +6,7 @@ import { sanitizeWorkflowyContent } from "../workflowy/markdown";
 export function registerQuickSendCommands(plugin: WorkflowySyncPlugin): void {
 	plugin.addCommand({
 		id: "send-to-workflowy",
-		name: "Workflowy: send selected text",
+		name: "Send selection",
 		editorCallback: async () => {
 			await runQuickSend(plugin, false);
 		},
@@ -14,7 +14,7 @@ export function registerQuickSendCommands(plugin: WorkflowySyncPlugin): void {
 
 	plugin.addCommand({
 		id: "send-to-workflowy-target",
-		name: "Workflowy: send selected text to target...",
+		name: "Send selection to…",
 		editorCallback: async () => {
 			await runQuickSend(plugin, true);
 		},
@@ -63,6 +63,11 @@ async function runQuickSend(
 		await plugin.rememberTarget(target);
 		new Notice(buildSuccessMessage(payload));
 	} catch (error) {
+		console.error("[workflowy-sync] Quick send failed", {
+			target,
+			markdown,
+			error,
+		});
 		new Notice(formatQuickSendError(error, target));
 	}
 }

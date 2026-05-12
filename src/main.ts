@@ -18,7 +18,7 @@ import type {
 	WorkflowyResolvedTarget,
 	WorkflowyTarget,
 } from "./types";
-import { WorkflowyClient } from "./workflowy/client";
+import { WorkflowyClient, type WorkflowyNodeSearchResult } from "./workflowy/client";
 import { formatTargetLabel } from "./workflowy/identifiers";
 
 export default class WorkflowySyncPlugin extends Plugin {
@@ -152,17 +152,16 @@ export default class WorkflowySyncPlugin extends Plugin {
 			return null;
 		}
 
-		const suggestions = await this.getTargetSuggestions(client);
 		return await new Promise<WorkflowyResolvedTarget | null>((resolve) => {
 			const modal = new WorkflowyTargetModal(this.app, {
 				initialValue,
-				suggestions,
+				getSuggestions: async (query) => await this.getTargetSuggestions(client, query),
 				onCancel: () => resolve(null),
 				onChoose: async (suggestion) => {
 					try {
 						const target = suggestion.target ?? await client.resolveTarget(suggestion.customInput ?? suggestion.identifier);
-						await this.rememberTarget(target);
 						resolve(target);
+						void this.rememberTarget(target);
 					} catch (error) {
 						const message = error instanceof Error ? error.message : "Unable to resolve that Workflowy target.";
 						new Notice(message);
@@ -394,14 +393,21 @@ export default class WorkflowySyncPlugin extends Plugin {
 			: `mapping-${Date.now()}`;
 	}
 
-	private async getTargetSuggestions(client: WorkflowyClient): Promise<WorkflowyTargetSuggestion[]> {
+	private async getTargetSuggestions(client: WorkflowyClient, query: string): Promise<WorkflowyTargetSuggestion[]> {
+		const normalizedQuery = query.trim().toLowerCase();
 		const targets = await client.listTargets();
 		const targetSuggestions = targets.map((target) => this.buildTargetSuggestion(target));
 		const recentSuggestions = await this.buildRecentSuggestions(client, targets);
+		const cachedNodeSuggestions = normalizedQuery
+			? (await client.searchCachedNodes(query, 20)).map((node) => this.buildNodeSuggestion(node))
+			: [];
+		const baseSuggestions = normalizedQuery
+			? [...recentSuggestions, ...targetSuggestions].filter((suggestion) => this.matchesTargetSuggestion(suggestion, normalizedQuery))
+			: [...recentSuggestions, ...targetSuggestions];
 		const seenIdentifiers = new Set<string>();
 		const mergedSuggestions: WorkflowyTargetSuggestion[] = [];
 
-		for (const suggestion of [...recentSuggestions, ...targetSuggestions]) {
+		for (const suggestion of [...baseSuggestions, ...cachedNodeSuggestions]) {
 			const normalizedIdentifier = suggestion.identifier.toLowerCase();
 			if (seenIdentifiers.has(normalizedIdentifier)) {
 				continue;
@@ -427,6 +433,29 @@ export default class WorkflowySyncPlugin extends Plugin {
 				type: "target",
 			},
 		};
+	}
+
+	private buildNodeSuggestion(node: WorkflowyNodeSearchResult): WorkflowyTargetSuggestion {
+		return {
+			title: node.label,
+			subtitle: node.path,
+			identifier: node.identifier,
+			category: "Node",
+			target: {
+				identifier: node.identifier,
+				label: node.label,
+				type: "node",
+			},
+		};
+	}
+
+	private matchesTargetSuggestion(suggestion: WorkflowyTargetSuggestion, normalizedQuery: string): boolean {
+		return [
+			suggestion.title,
+			suggestion.subtitle,
+			suggestion.identifier,
+			suggestion.category,
+		].join(" ").toLowerCase().includes(normalizedQuery);
 	}
 
 	private async buildRecentSuggestions(
