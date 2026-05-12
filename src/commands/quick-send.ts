@@ -88,23 +88,26 @@ function buildQuickSendPayload(
 	file: TFile | null,
 ): QuickSendPayload {
 	const sanitizedMarkdown = sanitizeWorkflowyContent(markdown);
-	const backlinkNote = plugin.settings.includeObsidianBacklink ? buildObsidianBacklink(plugin, file) : null;
+	const backlinkNode = plugin.settings.includeObsidianBacklink ? buildObsidianBacklinkNode(plugin, file) : null;
 
 	return {
 		target,
 		previewMarkdown: sanitizedMarkdown,
-		items: splitQuickSendItems(sanitizedMarkdown, backlinkNote),
+		items: splitQuickSendItems(sanitizedMarkdown, backlinkNode),
 	};
 }
 
-function buildObsidianBacklink(plugin: WorkflowySyncPlugin, file: TFile | null): string | null {
+function buildObsidianBacklinkNode(plugin: WorkflowySyncPlugin, file: TFile | null): { name: string; note: null } | null {
 	if (!file) {
 		return null;
 	}
 
 	const vaultName = encodeURIComponent(plugin.app.vault.getName());
 	const filePath = encodeURIComponent(file.path);
-	return `Source: [${file.basename}](obsidian://open?vault=${vaultName}&file=${filePath})`;
+	return {
+		name: sanitizeWorkflowyContent(`Source: [${file.basename}](obsidian://open?vault=${vaultName}&file=${filePath})`),
+		note: null,
+	};
 }
 
 function buildSuccessMessage(payload: QuickSendPayload): string {
@@ -141,25 +144,30 @@ function truncatePreview(value: string, maxLength = 48): string {
 
 function splitQuickSendItems(
 	markdown: string,
-	backlinkNote: string | null,
+	backlinkNode: { name: string; note: null } | null,
 ): Array<{ name: string; note: string | null }> {
-	const lines = markdown
+	const items = markdown
 		.replace(/\r\n/g, "\n")
 		.split("\n")
 		.map((line) => cleanQuickSendTitle(line))
-		.filter((line) => line.length > 0);
+		.filter((line) => line.length > 0)
+		.map((line) => ({
+			name: line,
+			note: null,
+		}));
 
-	if (lines.length === 0) {
-		return [{
+	if (items.length === 0) {
+		items.push({
 			name: "Quick send",
-			note: backlinkNote,
-		}];
+			note: null,
+		});
 	}
 
-	return lines.map((line) => ({
-		name: line,
-		note: backlinkNote,
-	}));
+	if (backlinkNode) {
+		items.push(backlinkNode);
+	}
+
+	return items;
 }
 
 function cleanQuickSendTitle(line: string): string {

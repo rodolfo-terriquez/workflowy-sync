@@ -130,7 +130,7 @@ export class WorkflowySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Include Obsidian backlink")
-			.setDesc("Add an Obsidian link to the created node note when sending content.")
+			.setDesc("Add one Obsidian source link node at the end when sending content.")
 			.addToggle((toggle) => {
 				toggle
 					.setValue(this.plugin.settings.includeObsidianBacklink)
