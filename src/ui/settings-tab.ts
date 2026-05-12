@@ -2,6 +2,11 @@ import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type WorkflowySyncPlugin from "../main";
 import type { SyncMapping } from "../types";
 
+function applyLegacyTooltip(element: HTMLElement, tooltip: string): void {
+	element.setAttribute("aria-label", tooltip);
+	element.setAttribute("title", tooltip);
+}
+
 export class WorkflowySettingTab extends PluginSettingTab {
 	private readonly plugin: WorkflowySyncPlugin;
 
@@ -22,7 +27,7 @@ export class WorkflowySettingTab extends PluginSettingTab {
 
 	private renderAuthenticationSettings(containerEl: HTMLElement): void {
 		new Setting(containerEl).setName("Authentication").setHeading();
-		const statusFragment = document.createDocumentFragment();
+		const statusFragment = window.activeDocument.createDocumentFragment();
 		statusFragment.createDiv({
 			text: this.plugin.settings.apiKey.trim()
 				? "API key saved. Use Test connection to verify it."
@@ -115,7 +120,7 @@ export class WorkflowySettingTab extends PluginSettingTab {
 			})
 			.addExtraButton((button) => {
 				button.setIcon("cross");
-				button.setTooltip("Clear default target");
+				applyLegacyTooltip(button.extraSettingsEl, "Clear default target");
 				button.onClick(async () => {
 					await this.plugin.clearDefaultTarget();
 					new Notice("Default target cleared.");
@@ -252,7 +257,7 @@ export class WorkflowySettingTab extends PluginSettingTab {
 			})
 			.addExtraButton((button) => {
 				button.setIcon("trash");
-				button.setTooltip("Delete mapping");
+				applyLegacyTooltip(button.extraSettingsEl, "Delete mapping");
 				button.onClick(async () => {
 					await this.plugin.removeMapping(mapping.id);
 					new Notice(`Deleted sync mapping: ${mapping.label}`);

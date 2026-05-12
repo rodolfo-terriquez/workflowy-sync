@@ -26,11 +26,11 @@ export async function syncMappingToNote(
 	if (existingFile instanceof TFile) {
 		if (sectionHeading) {
 			const renderedBody = serializeWorkflowyContent(filteredRootNode);
-			await plugin.app.vault.process(existingFile, (existingContent) => upsertSyncSection(
-				existingContent,
-				sectionHeading,
-				renderedBody,
-			));
+			const existingContent = await plugin.app.vault.read(existingFile);
+			await plugin.app.vault.modify(
+				existingFile,
+				upsertSyncSection(existingContent, sectionHeading, renderedBody),
+			);
 		} else {
 			const noteContent = serializeWorkflowyContent(filteredRootNode);
 			await confirmFirstSyncOverwrite(
@@ -40,7 +40,7 @@ export async function syncMappingToNote(
 				filteredRootNode.name.trim() || mapping.wfNodeLabel || mapping.wfNodeId,
 				options.allowOverwritePrompt ?? true,
 			);
-			await plugin.app.vault.process(existingFile, () => noteContent);
+			await plugin.app.vault.modify(existingFile, noteContent);
 		}
 	} else if (existingFile) {
 		throw new Error(`A folder already exists at ${notePath}. Choose a markdown file path instead.`);
@@ -153,7 +153,7 @@ function serializeNodeContent(node: ChildNode): string {
 		return decodeHtmlEntities(node.textContent ?? "");
 	}
 
-	if (!(node instanceof HTMLElement)) {
+	if (!node.instanceOf(HTMLElement)) {
 		return "";
 	}
 
@@ -288,7 +288,7 @@ async function ensureParentFolders(plugin: WorkflowySyncPlugin, notePath: string
 			throw new Error(`A file already exists at ${currentPath}. Choose another note path.`);
 		}
 
-		await plugin.app.vault.createFolder(currentPath);
+		await plugin.app.vault.adapter.mkdir(currentPath);
 	}
 }
 
